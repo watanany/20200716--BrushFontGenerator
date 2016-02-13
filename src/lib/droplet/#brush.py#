@@ -1,0 +1,255 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import random
+import numpy as np
+from math import *
+from abcbrush import AbstractBrush
+from dropletmodel import DropletModel
+from util import convert_wintab_azimuth, convert_wintab_altitude
+        
+        
+class Brush(AbstractBrush):
+    def __init__(self, param):
+        # 前提条件の確認
+        param_names = ['length', 'D', 'humidity', 'k', 'hair_number', 'pigment', 'threshold', 'p_tip']
+        assert all(p_name in param for p_name in param_names)
+        assert all(0 <= param[p_name] <= 1 for p_name in param if p_name in ['humidity', 'pigment', 'k'])
+
+        for p_name in param_names:
+            setattr(self, p_name, param[p_name])
+
+        self.state = 1
+        self.point = None
+        self.layer = []
+        self.pre_point = None
+        self.pre_layer = []
+        self.rate = None
+        self.count = 0
+
+        # 毛筆先端部分の向き(0: 初期の毛筆先端の向き、1: 毛筆底部の先端の向き、2: 毛筆上部の先端の向き)
+        self.tip_direction = [None, None, None]
+
+    def __getitem__(self, indices):
+        return self.layer[indices]
+        
+    def __iter__(self):
+        return iter(self.layer)
+
+    def update(self, point):
+        u'筆の状態を更新する'
+        if point[2] > 0:
+            self.pre_point = self.point
+            self.pre_layer = self.layer
+
+            self.point = np.array(point)
+            self.point[3] = convert_wintab_azimuth(self.point[3])
+            self.point[4] = convert_wintab_altitude(self.point[4])
+            
+            self.update_state()
+            self.update_model()
+            self.update_humidity()
+
+            self.count += 1
+        else:
+            self.count = 0
+
+    def update_state(self):
+        if (self.pre_point is None) or (self.point is None):
+            return
+        
+        if any(self.pre_point[0:2] != self.point[0:2]):
+            x, y, pressure, azimuth, altitude, time = self.point
+
+            # 条件に合わせて状態を更新する(State Machine)
+            if self.state in [1, 2]:
+                if self.humidity < self.threshold[(1, 2), 3]:
+                    self.state = 3
+
+            elif self.state in [3, 4, 5, 6]:
+                # 筆の動く方向を計算する
+                move_vector = self.point[0:2] - self.pre_point[0:2]
+                move_vector = self.normalize(move_vector)
+
+                # 筆の先端の上部分と下部分の向きを計算する
+                self.tip_direction[0] = np.array([cos(azimuth), sin(azimuth)])
+
+                for i, p_tip in enumerate(self.p_tip):
+                    self.tip_direction[i + 1] = p_tip * self.tip_direction[0] + (1 - p_tip) * (-move_vector)
+                    self.tip_direction[i + 1] = self.normalize(self.tip_direction[i + 1])
+
+                    
+                # 3 -> 4 or 5
+                if self.state in [3]:
+                    if np.cross(self.tip_direction[1], move_vector) != 0:
+                        self.state = 4
+                    if pressure < self.threshold[(3, 4), 5]:
+                        self.state = 5
+
+                # 4 -> 3 or 5
+                elif self.state in [4]:
+                    if np.cross(self.tip_direction[1], move_vector) == 0:
+                        self.state = 3
+                    if pressure < self.threshold[(3, 4), 5]:
+                        self.state = 5
+
+                # 5 or 6 -> 3 or 4
+                elif self.state in [5, 6]:
+                    if pressure >= self.threshold[(3, 4), 5]:
+                        if np.cross(self.tip_direction[1], move_vector) == 0:
+                            self.state = 3
+                        else:
+                            self.state = 4
+            else:
+                raise RuntimeError()
+
+    def update_model(self):
+        u'現在の座標と筆の状態、ドロップレットモデルの遷移状態によってドロップレットの形を計算し更新する'
+        x, y, pressure, azimuth, altitude, time = self.point
+        d1 = self.D * pressure
+        d2 = d1 * self.k * self.humidity
+        h = self.length * pressure
+        
+        # ドロップレットの分割状態の割合を計算する(遷移1, 2は筆先が割れない)
+        if self.state in [1, 2]:
+            self.rate = [1.0]
+            
+        else:
+            if len(self.rate) == 1 or len(self.rate) < self.hair_number and random.randint(0, 1) == 0:
+            #     index = random.randint(0, len(self.rate) -  1)
+                
+            #     # 分割する割合用に0でない乱数を発生させる
+            #     s = random.random()
+            #     while s == 0:
+            #         s = random.random()
+
+            #     # rateを更新し、筆先を割る
+            #     tmp = [s * self.rate[index], (1 - s) * self.rate[index]]
+            #     self.rate = self.rate[:index] + tmp + self.rate[index + 1:]
+                
+            # else:
+            #     index = random.randint(0, len(self.rate) - 2)
+            #     tmp = [self.rate[index] + self.rate[index + 1]]
+            #     self.rate = self.rate[:index] + tmp + self.rate[index + 2:]
+                n = 10
+                self.rate = [1.0 / n] * n
+
+        # 実際にドロップレットモデルを作る
+        if self.state in [1, 2, 3]:
+            # 遷移状態が 1, 2, 3 の場合
+            self.layer = [
+                DropletModel(d1, d2, h, self.rate),
+            ]
+            for model in self.layer:
+                model.rotate(azimuth, 0, 0)
+
+        elif self.state in [4]:
+            # 遷移状態が 4 の場合
+            self.layer = [
+                DropletModel(d1, d2, h, self.rate),
+                #DropletModel(d1, d2, h * 0.5, self.rate),
+            ]
+
+            # 回転角度を計算する
+            for model in self.layer:
+                model.rotate(azimuth, 0, 0)
+
+            # for i, model in enumerate(self.layer):
+            #     angle = self.angle_between(self.tip_direction[0],
+            #                                self.tip_direction[i + 1])
+            #     model.rotate(angle, *model.center)
+                
+        elif self.state in [5, 6]:
+            # 遷移状態が 5, 6 の場合
+            e = np.array([1, 0])
+            layer = []
+
+            print d1, d2, h, self.rate
+            
+
+            #for i, model in enumerate(self.layer):
+                #m = DropletModel(model.d1, model.d2, model.h, model.rate)
+                #m.rotate(azimuth, 0, 0)
+
+                # angle = self.angle_between(self.tip_direction[0],
+                #                            self.tip_direction[i + 1])
+                # m.rotate(angle, *m.center)
+                
+                # if i == len(self.layer) - 1:
+                #     a = 1.0
+                #     m.redefine(d1 * a, d2 * a, h * a)
+
+                #layer.append(m)
+
+            self.layer = layer
+        else:
+            raise RuntimeError()
+
+        # 現在の座標値点に平行移動する
+        for model in self.layer:
+            model.translate(x, y)
+
+    def update_humidity(self):
+        u"筆の湿度を更新する"
+        # def f(t, Ap, a=1.0):
+        #     return Ap * a * tan(0.01 * t) / pi
+        
+        # stroke_area = self.calc_stroke_area()
+        # t = self.point[5]
+        # Ap = 0.8
+        # reduction = self.humidity * stroke_area * f(t, Ap, a=0.001)
+
+        # if self.humidity - reduction < 0:
+        #     self.humidity = 0
+        #     self.dip()
+        #     #raise RuntimeError('brush humidity is less than 0')
+
+        # reduction = 0.0008
+        # if self.humidity - reduction < 0.1:
+        #     self.humidity = 1.0
+        # else:
+        #     self.humidity -= reduction
+        pass
+        
+    def calc_stroke_area(self):
+        raise NotImplemented()
+        # area = 0
+        # if len(self.pre_layer) != 0:
+        #     area += self.pre_layer[0].area
+        # if len(self.layer) != 0:
+        #     area += self.layer[0].area
+        # return area
+        
+    @staticmethod
+    def angle_between(v1, v2):
+        u'2つのベクトルの間の角度(0°～180°)を計算しラジアンで返す'
+        return acos(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+
+    @staticmethod
+    def normalize(array):
+        u'ベクトルを正規化する'
+        norm = np.linalg.norm(array)
+        return array / norm if norm != 0 else array
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
